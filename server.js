@@ -4,10 +4,15 @@ import { Pool } from 'pg';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import https from 'https';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import slowDown from 'express-slow-down';
+import compression from 'compression';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { validate, schemas, validateQuery } from './src/utils/validation.js';
+import Logger from './src/utils/logger.js';
 
 dotenv.config();
 
@@ -17,11 +22,16 @@ const __dirname = dirname(__filename);
 const app = express();
 const port = process.env.PORT || 3000;
 
-console.log('🚀 Starting server...');
-console.log('📁 __dirname:', __dirname);
-console.log('📁 dist path:', path.join(__dirname, 'dist'));
+Logger.info('🚀 Starting IP Threat Management System...');
 
-// Database connection with increased timeout
+// Security Configuration
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  Logger.error('JWT_SECRET environment variable is required');
+  process.exit(1);
+}
+
+// Database connection with enhanced configuration
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT || 5432,
@@ -32,106 +42,163 @@ const pool = new Pool({
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 60000,
+  statement_timeout: 30000,
+  query_timeout: 30000,
 });
 
 // Test database connection
 pool.connect((err, client, release) => {
   if (err) {
-    console.error('❌ Error connecting to database:', err.stack);
+    Logger.error('Database connection failed:', err.stack);
+    process.exit(1);
   } else {
-    console.log('✅ Connected to PostgreSQL database');
+    Logger.info('✅ Connected to PostgreSQL database');
     release();
   }
 });
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Security Middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+}));
 
-// Add request logging
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Stricter rate limiting for auth endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 auth requests per windowMs
+  message: 'Too many authentication attempts, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Slow down repeated requests
+const speedLimiter = slowDown({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  delayAfter: 50, // allow 50 requests per windowMs without delay
+  delayMs: 500, // add 500ms delay per request after delayAfter
+});
+
+// Apply rate limiting
+app.use('/api/auth', authLimiter);
+app.use('/api', limiter);
+app.use(speedLimiter);
+
+// General Middleware
+app.use(compression());
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:5173'],
+  credentials: true,
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Request logging middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  Logger.http(`${req.method} ${req.path} - ${req.ip}`);
   next();
 });
 
-// Basic health check route
-app.get('/', (req, res) => {
-  res.json({ 
-    message: 'Abuse IP Detector Server',
-    status: 'running',
-    timestamp: new Date().toISOString(),
-    port: port
-  });
-});
-
-// API health check
-app.get('/api', (req, res) => {
-  res.json({ 
-    message: 'Abuse IP Detector API',
-    status: 'running',
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    database: 'connected',
-    environment: process.env.NODE_ENV 
-  });
-});
-
-// JWT middleware
+// JWT Authentication Middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) {
-    return res.sendStatus(401);
+    return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret', (err, user) => {
-    if (err) return res.sendStatus(403);
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      Logger.warn(`Invalid token attempt from ${req.ip}`);
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
     req.user = user;
     next();
   });
 };
 
-// Authentication
-app.post('/api/auth/login', async (req, res) => {
+// Role-based authorization middleware
+const requireRole = (roles) => {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      Logger.warn(`Unauthorized access attempt by ${req.user?.username} (${req.user?.role}) to ${req.path}`);
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    next();
+  };
+};
+
+// Error handling middleware
+const errorHandler = (err, req, res, next) => {
+  Logger.error(`Error in ${req.method} ${req.path}:`, err);
+  
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'File too large' });
+  }
+  
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  
+  res.status(500).json({ error: 'Internal server error' });
+};
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+// Authentication Routes
+app.post('/api/auth/login', validate(schemas.login), async (req, res) => {
   try {
     const { username, password } = req.body;
     
-    console.log('Login attempt:', { username, password: '***' });
+    Logger.info(`Login attempt for username: ${username}`);
     
     const result = await pool.query(
       'SELECT * FROM users WHERE LOWER(username) = LOWER($1) AND is_active = true',
       [username]
     );
     
-    console.log('Database query result:', result.rows.length, 'users found');
-    
     if (result.rows.length === 0) {
-      console.log('No user found with username:', username);
+      Logger.warn(`Failed login attempt - user not found: ${username}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
     const user = result.rows[0];
-    console.log('Found user:', { 
-      id: user.id, 
-      username: user.username, 
-      role: user.role, 
-      is_active: user.is_active
-    });
     
-    // Simple password comparison (in production, use bcrypt)
-    if (password !== user.password) {
-      console.log('Password mismatch');
+    // Use bcrypt to compare passwords
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      Logger.warn(`Failed login attempt - invalid password for user: ${username}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
-    console.log('Password match successful');
+    // Update last login
+    await pool.query(
+      'UPDATE users SET last_login = NOW() WHERE id = $1',
+      [user.id]
+    );
     
     const token = jwt.sign(
       { 
@@ -140,139 +207,200 @@ app.post('/api/auth/login', async (req, res) => {
         role: user.role,
         assignedCategories: user.assigned_categories 
       },
-      process.env.JWT_SECRET || 'fallback-secret',
-      { expiresIn: '24h' }
+      JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
     );
     
-    console.log('JWT token generated successfully');
-    
     const { password: _, ...userResponse } = user;
-    console.log('Login successful for user:', username);
-    res.json({ user: userResponse, token });
+    Logger.info(`Successful login for user: ${username}`);
+    
+    res.json({
+      message: 'Login successful',
+      token,
+      user: userResponse
+    });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Login failed' });
+    Logger.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Users
-app.get('/api/users', authenticateToken, async (req, res) => {
+// User Routes
+app.get('/api/users', authenticateToken, requireRole(['admin']), async (req, res) => {
   try {
-    if (req.user.role !== 'superadmin') {
-      return res.status(403).json({ error: 'Access denied' });
+    const result = await pool.query(
+      'SELECT id, username, email, role, is_active, assigned_categories, created_at, last_login FROM users ORDER BY created_at DESC'
+    );
+    res.json(result.rows);
+  } catch (error) {
+    Logger.error('Error fetching users:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+app.post('/api/users', authenticateToken, requireRole(['admin']), validate(schemas.createUser), async (req, res) => {
+  try {
+    const { username, password, email, role, assignedCategories } = req.body;
+    
+    // Hash password before storing
+    const hashedPassword = await bcrypt.hash(password, 12);
+    
+    const result = await pool.query(
+      `INSERT INTO users (username, password, email, role, assigned_categories, is_active, created_at) 
+       VALUES ($1, $2, $3, $4, $5, true, NOW()) 
+       RETURNING id, username, email, role, is_active, assigned_categories, created_at`,
+      [username, hashedPassword, email, role, assignedCategories]
+    );
+    
+    Logger.info(`New user created: ${username} by ${req.user.username}`);
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    if (error.code === '23505') { // Unique constraint violation
+      return res.status(409).json({ error: 'Username or email already exists' });
+    }
+    Logger.error('Error creating user:', error);
+    res.status(500).json({ error: 'Failed to create user' });
+  }
+});
+
+app.put('/api/users/:id', authenticateToken, requireRole(['admin']), validate(schemas.updateUser), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+    
+    // Build dynamic query
+    const setClause = Object.keys(updates)
+      .map((key, index) => `${key} = $${index + 2}`)
+      .join(', ');
+    
+    const values = [id, ...Object.values(updates)];
+    
+    const result = await pool.query(
+      `UPDATE users SET ${setClause}, updated_at = NOW() 
+       WHERE id = $1 
+       RETURNING id, username, email, role, is_active, assigned_categories, created_at, updated_at`,
+      values
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
     }
     
-    const result = await pool.query('SELECT id, username, email, role, assigned_categories, is_active, must_change_password, created_by, created_at FROM users ORDER BY created_at DESC');
-    res.json(result.rows);
+    Logger.info(`User updated: ${result.rows[0].username} by ${req.user.username}`);
+    res.json(result.rows[0]);
   } catch (error) {
-    console.error('Get users error:', error);
-    res.status(500).json({ error: 'Failed to get users' });
+    Logger.error('Error updating user:', error);
+    res.status(500).json({ error: 'Failed to update user' });
   }
 });
 
-// Categories
-app.get('/api/categories', authenticateToken, async (req, res) => {
+app.delete('/api/users/:id', authenticateToken, requireRole(['admin']), async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM categories ORDER BY created_at');
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Get categories error:', error);
-    res.status(500).json({ error: 'Failed to get categories' });
-  }
-});
-
-// IP Entries
-app.get('/api/ip-entries', authenticateToken, async (req, res) => {
-  try {
-    const { category } = req.query;
+    const { id } = req.params;
     
-    let query = `
-      SELECT ie.*, c.name as category_name, c.label as category_label, c.id as category_id
-      FROM ip_entries ie 
-      JOIN categories c ON ie.category_id = c.id
-    `;
-    let params = [];
-    
-    if (category) {
-      query += ' WHERE c.id = $1';
-      params.push(category);
+    // Prevent self-deletion
+    if (id === req.user.userId) {
+      return res.status(400).json({ error: 'Cannot delete your own account' });
     }
     
-    query += ' ORDER BY ie.date_added DESC';
+    const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING username', [id]);
     
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    Logger.info(`User deleted: ${result.rows[0].username} by ${req.user.username}`);
+    res.json({ message: 'User deleted successfully' });
   } catch (error) {
-    console.error('Get IP entries error:', error);
-    res.status(500).json({ error: 'Failed to get IP entries' });
+    Logger.error('Error deleting user:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
   }
 });
 
-// Whitelist
-app.get('/api/whitelist', authenticateToken, async (req, res) => {
+// Password change endpoint
+app.post('/api/auth/change-password', authenticateToken, validate(schemas.changePassword), async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM whitelist ORDER BY date_added DESC');
-    res.json(result.rows);
+    const { currentPassword, newPassword } = req.body;
+    const userId = req.user.userId;
+    
+    // Get current user
+    const userResult = await pool.query('SELECT password FROM users WHERE id = $1', [userId]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Verify current password
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, userResult.rows[0].password);
+    if (!isCurrentPasswordValid) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+    
+    // Hash new password
+    const hashedNewPassword = await bcrypt.hash(newPassword, 12);
+    
+    // Update password
+    await pool.query(
+      'UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2',
+      [hashedNewPassword, userId]
+    );
+    
+    Logger.info(`Password changed for user: ${req.user.username}`);
+    res.json({ message: 'Password changed successfully' });
   } catch (error) {
-    console.error('Get whitelist error:', error);
-    res.status(500).json({ error: 'Failed to get whitelist' });
+    Logger.error('Error changing password:', error);
+    res.status(500).json({ error: 'Failed to change password' });
   }
 });
 
-// EDL Feed
-app.get('/api/edl/:category', async (req, res) => {
-  try {
-    const categoryName = req.params.category;
-    
-    const result = await pool.query(`
-      SELECT ie.ip 
-      FROM ip_entries ie 
-      JOIN categories c ON ie.category_id = c.id 
-      WHERE (c.name = $1 OR c.id = $1)
-      AND ie.ip NOT IN (SELECT ip FROM whitelist)
-      ORDER BY ie.date_added DESC
-    `, [categoryName]);
-    
-    const ips = result.rows.map(row => row.ip);
-    
-    res.set('Content-Type', 'text/plain');
-    res.send(ips.join('\n'));
-  } catch (error) {
-    console.error('Get EDL feed error:', error);
-    res.status(500).json({ error: 'Failed to get EDL feed' });
-  }
-});
+// Static file serving (production)
+if (process.env.NODE_ENV === 'production') {
+  const distPath = path.join(__dirname, 'dist');
+  app.use(express.static(distPath));
+  
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api/')) {
+      return res.status(404).json({ error: 'API endpoint not found' });
+    }
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+}
 
-// Serve static files from dist directory
-console.log('📁 Serving static files from:', path.join(__dirname, 'dist'));
-app.use(express.static(path.join(__dirname, 'dist')));
+// Error handling
+app.use(errorHandler);
 
-// Serve React app for all other routes
-app.get('*', (req, res) => {
-  console.log('Serving React app for route:', req.path);
-  const indexPath = path.join(__dirname, 'dist', 'index.html');
-  console.log('📄 Serving index.html from:', indexPath);
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// Start server
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-  console.log(`🌐 Application: http://localhost:${port}`);
-  console.log(`📡 API: http://localhost:${port}/api`);
-  console.log(`📁 Serving static files from: ${path.join(__dirname, 'dist')}`);
+// 404 handler for API routes
+app.use('/api/*', (req, res) => {
+  res.status(404).json({ error: 'API endpoint not found' });
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  pool.end(() => {
-    process.exit(0);
+const gracefulShutdown = (signal) => {
+  Logger.info(`Received ${signal}, shutting down gracefully`);
+  
+  server.close(() => {
+    Logger.info('HTTP server closed');
+    
+    pool.end(() => {
+      Logger.info('Database connection pool closed');
+      process.exit(0);
+    });
   });
+  
+  // Force close after 30 seconds
+  setTimeout(() => {
+    Logger.error('Could not close connections in time, forcefully shutting down');
+    process.exit(1);
+  }, 30000);
+};
+
+const server = app.listen(port, () => {
+  Logger.info(`🚀 Server running on port ${port}`);
+  Logger.info(`🌐 Application: http://localhost:${port}`);
+  Logger.info(`📡 API: http://localhost:${port}/api`);
+  Logger.info(`🔒 Security: Helmet, Rate Limiting, and CORS enabled`);
 });
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+export default app;
